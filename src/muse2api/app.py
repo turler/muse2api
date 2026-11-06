@@ -59,7 +59,11 @@ def create_app(settings: Settings | None = None, driver: MuseDriver | None = Non
         await services.requests.backfill_tasks(services.tasks.list(limit=services.tasks.max_kept))
         await services.driver.startup()
         if sync := getattr(services.driver, "sync_profile_account", None):
-            await sync(services.pool)
+            try:
+                await sync(services.pool)
+            except Exception:  # noqa: BLE001
+                # The cookie source may be down at boot; keepalive retries the sync.
+                log.exception("syncing the browser profile login failed")
         for acc in services.pool.all():
             if acc.enabled and acc.status != AccountStatus.INVALID:
                 services.driver.prewarm(acc)

@@ -132,3 +132,91 @@ async def test_profile_login_is_mirrored_into_the_browser_account(tmp_path, monk
     acc = await drv.sync_profile_account(pool)
     assert acc.id == "browser" and pool.get("browser").cookies["hatch_sess"] == "s"
     assert acc.cookie_expires == {"hatch_sess": 99}
+
+
+# ---- headless browser borrowing the login of a cookie source browser (Brave) ----
+
+from muse2api.drivers.base import SessionInfo  # noqa: E402
+from muse2api.drivers.browser.cookies import CookieSource, muse_cookies  # noqa: E402
+
+
+def test_muse_cookies_keeps_only_muse_domains():
+    raw = [
+        {"name": "hatch_sess", "value": "s", "domain": ".muse.ai", "expires": 123.9},
+        {"name": "x", "value": "1", "domain": "app.muse.ai", "expires": -1},
+        {"name": "hatch_sess", "value": "evil", "domain": "notmuse.ai"},
+        {"name": "empty", "value": "", "domain": "muse.ai"},
+    ]
+    assert muse_cookies(raw) == ({"hatch_sess": "s", "x": "1"}, {"hatch_sess": 123})
+
+
+class _FakeSource(CookieSource):
+    def __init__(self, jar):
+        super().__init__("127.0.0.1:9")
+        self.jar, self.written = jar, []
+
+    async def get_cookies(self):
+        return [{"name": k, "value": v, "domain": ".muse.ai"} for k, v in self.jar.items()]
+
+    async def set_cookies(self, cookies):
+        self.written.extend(cookies)
+
+
+def _headless(tmp_path, jar):
+    drv = _drv(tmp_path, cookie_source_cdp="127.0.0.1:9")
+    drv._cookie_source = _FakeSource(jar)
+    return drv
+
+
+async def test_headless_driver_syncs_the_account_from_the_cookie_source(tmp_path):
+    drv = _headless(tmp_path, {"hatch_sess": "s1", "hatch_native_auth_device": "d"})
+    pool = AccountPool(JsonAccountStore(tmp_path / "accounts.json"))
+    acc = await drv.sync_profile_account(pool)
+    assert acc is not None and acc.cookies["hatch_sess"] == "s1"
+    # Isolated context + imported cookies: the headless browser keeps its own jar.
+    assert drv._target_params("ctx")["browserContextId"] == "ctx"
+
+
+async def test_invalid_account_revives_only_on_a_new_profile_login(tmp_path):
+    from muse2api.accounts.model import AccountStatus
+
+    drv = _headless(tmp_path, {"hatch_sess": "s1", "hatch_native_auth_device": "d"})
+    pool = AccountPool(JsonAccountStore(tmp_path / "accounts.json"))
+    acc = await drv.sync_profile_account(pool)
+    acc.status = AccountStatus.INVALID
+    await drv.sync_profile_account(pool)
+    assert pool.get("browser").status == AccountStatus.INVALID  # same dead session
+    drv._cookie_source.jar["hatch_sess"] = "s2"  # user logged in again in Brave
+    await drv.sync_profile_account(pool)
+    assert pool.get("browser").status == AccountStatus.ACTIVE
+
+
+async def test_renewal_uses_profile_cookies_and_writes_rotations_back(tmp_path, monkeypatch):
+    drv = _headless(tmp_path, {"hatch_sess": "s1", "hatch_native_auth_device": "d",
+                               "hatch_vml": "old"})
+    seen = {}
+
+    async def fake_renew(account):
+        seen.update(account.cookies)
+        return SessionInfo(ok=True, cookies={**account.cookies, "hatch_vml": "new"},
+                           cookie_expires={"hatch_vml": 2_000_000_000})
+
+    monkeypatch.setattr(drv, "_renew_isolated", fake_renew)
+    stale = Account(id="browser", cookies={"hatch_sess": "stale"})
+    info = await drv.renew_session(stale)
+    assert seen["hatch_sess"] == "s1"  # the profile's current login, not the stale copy
+    assert info.cookies["hatch_vml"] == "new"
+    assert [c["name"] for c in drv._cookie_source.written] == ["hatch_vml"]
+
+
+async def test_other_accounts_renew_as_before(tmp_path, monkeypatch):
+    drv = _headless(tmp_path, {"hatch_sess": "s1", "hatch_native_auth_device": "d"})
+    called = []
+
+    async def fake_renew(account):
+        called.append(account.id)
+        return SessionInfo(ok=True)
+
+    monkeypatch.setattr(drv, "_renew_isolated", fake_renew)
+    await drv.renew_session(Account(id="acc_other", cookies={"hatch_sess": "x"}))
+    assert called == ["acc_other"] and drv._cookie_source.written == []

@@ -19,7 +19,7 @@ import contextlib
 import logging
 import os
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
@@ -49,6 +49,7 @@ from ..base import (
 from . import dom
 from .cdp import CDPError, CDPSession
 from .chromium import ChromiumProcess, find_chromium
+from .cookies import CookieSource, muse_cookies
 
 log = logging.getLogger(__name__)
 
@@ -130,6 +131,12 @@ class BrowserDriver(MuseDriver):
         self._quota_cache: dict[str, dict[str, Any]] = {}
         self._quota_locks: dict[str, asyncio.Lock] = {}
         self._warming: dict[str, asyncio.Task] = {}
+        # Browser whose profile lends its muse.ai login (MUSE2API_COOKIE_SOURCE_CDP).
+        self._cookie_source: CookieSource | None = None
+        if settings.cookie_source_cdp:
+            self._cookie_source = CookieSource(
+                settings.cookie_source_cdp, settings.cookie_source_launch_cmd,
+                settings.browser_launch_wait)
 
     # ------------------------------------------------------------ lifecycle
     async def startup(self) -> None:
@@ -930,61 +937,83 @@ class BrowserDriver(MuseDriver):
     # ------------------------------------------------------------ session
     PROFILE_ACCOUNT_ID = "browser"
 
+    @property
+    def _profile_login(self) -> bool:
+        """The account ``browser`` follows a real browser profile's muse.ai login:
+        either the attached browser itself (shared profile) or a separate cookie
+        source browser (``MUSE2API_COOKIE_SOURCE_CDP``)."""
+        return self.settings.shared_profile or bool(self._cookie_source)
+
     async def sync_profile_account(self, pool: Any) -> Account | None:
-        """Shared-profile mode: mirror the browser profile's muse.ai login into the
-        account ``browser`` so the pool, keepalive and dashboard work unchanged."""
-        if not self.settings.shared_profile:
+        """Mirror the browser profile's muse.ai login into the account ``browser`` so the
+        pool, keepalive and dashboard work unchanged."""
+        if not self._profile_login:
             return None
         cookies, expires = await self.profile_cookies()
         acc = pool.get(self.PROFILE_ACCOUNT_ID) or Account(
             id=self.PROFILE_ACCOUNT_ID, label="Browser profile")
+        relogged = cookies.get("hatch_sess") != acc.cookies.get("hatch_sess")
         acc.cookies, acc.cookie_expires = cookies, expires
         if muse.missing_session_cookies(cookies):
             log.warning("the browser profile is not logged in to muse.ai; log in there")
             acc.last_error = "browser profile is not logged in to muse.ai"
-        elif acc.status == AccountStatus.INVALID:
+        elif acc.status == AccountStatus.INVALID and relogged:
+            # A new session in the profile (the user logged in again) revives the account.
             acc.status = AccountStatus.ACTIVE
             acc.last_error = None
         await pool.upsert(acc)
+        log.info("account '%s' synced from the browser profile (%d muse.ai cookies)",
+                 acc.id, len(cookies))
         return acc
 
     async def profile_cookies(self) -> tuple[dict[str, str], dict[str, int]]:
-        """muse.ai cookies of the browser profile's default context (shared-profile mode)."""
-        await self._ensure_browser()
-        assert self._browser
-        res = await self._browser.send("Storage.getCookies", {})
-        cookies: dict[str, str] = {}
-        expires: dict[str, int] = {}
-        for c in res.get("cookies", []):
-            if not c.get("domain", "").lstrip(".").endswith("muse.ai") or not c.get("value"):
-                continue
-            cookies[c["name"]] = c["value"]
-            if (exp := c.get("expires") or 0) > 0:
-                expires[c["name"]] = int(exp)
-        return cookies, expires
+        """muse.ai cookies of the profile browser's default context."""
+        if self._cookie_source:
+            raw = await self._cookie_source.get_cookies()
+        else:
+            await self._ensure_browser()
+            assert self._browser
+            raw = (await self._browser.send("Storage.getCookies", {})).get("cookies", [])
+        return muse_cookies(raw)
+
+    async def _write_profile_cookies(self, account: Account, names: Iterable[str]) -> None:
+        """Write rotated cookies back into the profile browser, so its own login stays
+        valid after muse.ai rotates the session."""
+        fresh = account.model_copy(update={
+            "cookies": {n: account.cookies[n] for n in names if account.cookies.get(n)}})
+        params = self._cookie_params(fresh)
+        if not params:
+            return
+        try:
+            if self._cookie_source:
+                await self._cookie_source.set_cookies(params)
+            elif self._browser:
+                await self._browser.send("Storage.setCookies", {"cookies": params})
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not write rotated cookies back to the browser: %s", exc)
 
     async def renew_session(self, account: Account) -> SessionInfo:
-        if self.settings.shared_profile:
-            return await self._renew_shared(account)
-        return await self._renew_isolated(account)
-
-    async def _renew_shared(self, account: Account) -> SessionInfo:
-        """The profile's cookie jar is the source of truth: renew with what the browser
-        holds now and write rotated cookies straight back into it."""
+        if not self._profile_login or account.id != self.PROFILE_ACCOUNT_ID:
+            return await self._renew_isolated(account)
+        # The profile's cookie jar is the source of truth: renew with what it holds
+        # now (the user may have logged in again) and write rotations back into it.
         cookies, expires = await self.profile_cookies()
         if muse.missing_session_cookies(cookies):
             raise UpstreamAuthError("the browser profile is not logged in to muse.ai")
-        info = await muse.renew_session(cookies)
-        changed = {k: v for k, v in info.cookies.items() if cookies.get(k) != v}
-        if changed and self._browser:
-            fresh = account.model_copy(update={
-                "cookies": changed,
-                "cookie_expires": {**expires, **info.cookie_expires},
-            })
-            with contextlib.suppress(CDPError, TimeoutError):
-                await self._browser.send("Storage.setCookies", {
-                    "cookies": self._cookie_params(fresh)})
-        info.cookie_expires = {**expires, **info.cookie_expires}
+        current = account.model_copy(update={
+            "cookies": cookies, "cookie_expires": {**account.cookie_expires, **expires}})
+        if self.settings.shared_profile:
+            info = await muse.renew_session(cookies)
+        else:
+            info = await self._renew_isolated(current)
+        merged = current.model_copy(update={
+            "cookies": {**cookies, **info.cookies},
+            "cookie_expires": {**current.cookie_expires, **info.cookie_expires}})
+        changed = [k for k, v in info.cookies.items() if cookies.get(k) != v]
+        if changed:
+            await self._write_profile_cookies(merged, changed)
+        info.cookies = merged.cookies
+        info.cookie_expires = merged.cookie_expires
         return info
 
     async def _renew_isolated(self, account: Account) -> SessionInfo:

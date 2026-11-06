@@ -88,6 +88,18 @@ class Settings(BaseSettings):
         "browser context) instead of one isolated context per account with imported "
         "cookies. An account named 'browser' is created/synced from the profile cookies.",
     )
+    cookie_source_cdp: str = Field(
+        default="",
+        description="DevTools endpoint (host:port) of an everyday browser, e.g. Brave, whose "
+        "muse.ai login the headless browser borrows. The account 'browser' is synced "
+        "from that profile's cookies at startup and on every keepalive, and rotated "
+        "cookies are written back. Nothing is opened in that browser.",
+    )
+    cookie_source_launch_cmd: str = Field(
+        default="",
+        description="Shell command that starts the cookie source browser when its "
+        "DevTools port does not answer.",
+    )
     browser_proxy: str = Field(
         default="",
         description="Proxy for the browser only, e.g. socks5://127.0.0.1:10808 or http://10.144.1.10:8080. "

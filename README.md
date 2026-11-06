@@ -336,12 +336,27 @@ All settings come from environment variables (prefix `MUSE2API_`) or a `.env` fi
 | `MUSE2API_CDP_HOST` · `MUSE2API_CDP_PORT` | `127.0.0.1` · `19210` | DevTools endpoint (attach mode can point at a tunnel) |
 | `MUSE2API_BROWSER_LAUNCH_CMD` | empty | Attach mode: shell command that starts the browser when the port does not answer |
 | `MUSE2API_TAB_MODE` | `window` | `minimized`: a background window per tab, created minimized, never appears or steals focus and keeps rendering (use with attach); `background`: background tabs in an existing window; `window`: a window per tab; `hidden`: windowless, but never painted so muse.ai does not hydrate (experimental) |
+| `MUSE2API_COOKIE_SOURCE_CDP` | empty | `host:port` of an everyday browser (e.g. Brave) whose muse.ai login the headless browser borrows; account `browser` follows it, rotated cookies are written back |
+| `MUSE2API_COOKIE_SOURCE_LAUNCH_CMD` | empty | Shell command that starts that browser when its DevTools port does not answer |
 | `MUSE2API_SHARED_PROFILE` | `false` | Attach mode: use the browser profile's own muse.ai login (account `browser`) instead of imported cookies |
 | `MUSE2API_KEEPALIVE_ENABLED` | `true` | Periodically renew sessions and wake each account's VM in the background |
 | `MUSE2API_KEEPALIVE_INTERVAL` | `600` | Seconds between keepalive rounds |
 | `MUSE2API_WAKE_CONFIRM_S` | `20` | Seconds to wait for a woken VM to report `RUNNING` |
 | `MUSE2API_QUOTA_CACHE_S` | `1800` | How long a quota reading is reused before muse.ai is asked again |
 | `MUSE2API_MATTING_MODEL` | `birefnet-general` | Model for `background: "transparent"` (`birefnet-general-lite` is faster) |
+
+## Headless, logged in with your Brave session
+
+Keep the default headless Chromium, but take the muse.ai login from the Brave (or Chrome) you already use instead of pasting cookies:
+
+```env
+MUSE2API_DRIVER=browser
+MUSE2API_COOKIE_SOURCE_CDP=127.0.0.1:9222   # Brave started with --remote-debugging-port=9222
+```
+
+* At startup and on every keepalive round the account `browser` is synced from Brave's cookie jar, so logging in again in Brave revives it.
+* All requests run in the headless browser; Brave is only read over DevTools (`Storage.getCookies`), no tab or window is opened there.
+* When muse.ai rotates the session, the new cookies are written back into Brave so both stay logged in.
 
 ## Using your own Brave (attach mode)
 

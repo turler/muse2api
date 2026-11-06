@@ -47,6 +47,13 @@ async def keepalive_loop(pool: AccountPool, driver: MuseDriver, interval: float)
     log.info("keepalive loop started (interval=%ss)", interval)
     while True:
         await asyncio.sleep(interval)
+        # Accounts that follow a browser profile pick up a fresh login from it first,
+        # so an account marked invalid comes back once the user logs in again.
+        if sync := getattr(driver, "sync_profile_account", None):
+            try:
+                await sync(pool)
+            except Exception:  # noqa: BLE001
+                log.exception("syncing the browser profile login failed")
         for acc in pool.all():
             if not acc.enabled or acc.status == AccountStatus.INVALID:
                 continue
