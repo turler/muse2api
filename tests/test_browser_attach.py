@@ -17,6 +17,7 @@ def _drv(tmp_path, **kw) -> BrowserDriver:
 
 
 @pytest.mark.parametrize("mode,attach,expected", [
+    ("minimized", True, {"newWindow": True, "background": True, "windowState": "minimized"}),
     ("hidden", True, {"hidden": True}),
     ("background", True, {"background": True}),
     ("window", False, {"newWindow": True}),
@@ -29,7 +30,7 @@ def test_target_params_per_tab_mode(tmp_path, mode, attach, expected):
 
 
 def test_shared_profile_uses_the_default_context(tmp_path):
-    drv = _drv(tmp_path, tab_mode="hidden", browser_mode="attach", shared_profile=True)
+    drv = _drv(tmp_path, tab_mode="minimized", browser_mode="attach", shared_profile=True)
     assert "browserContextId" not in drv._target_params("")
 
 

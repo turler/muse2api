@@ -260,9 +260,14 @@ class BrowserDriver(MuseDriver):
         if context_id:
             params["browserContextId"] = context_id
         mode = self.settings.tab_mode
-        if mode == "hidden":
-            # No window, no tab strip entry, never takes focus; still renders as a
-            # visible page, so timers and rAF are not throttled.
+        if mode == "minimized":
+            # Own window, born minimized and in the background: nothing appears on
+            # screen and focus stays where the user left it, yet the page keeps
+            # rendering (timers and rAF measured unthrottled with focus emulation).
+            params.update(newWindow=True, background=True, windowState="minimized")
+        elif mode == "hidden":
+            # Windowless target. Never painted (rAF does not fire), so muse.ai stays
+            # in its server-rendered state; experiments only.
             params["hidden"] = True
         elif mode == "background":
             params["background"] = True

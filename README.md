@@ -335,7 +335,7 @@ All settings come from environment variables (prefix `MUSE2API_`) or a `.env` fi
 | `MUSE2API_BROWSER_MODE` | `launch` | `launch`: dedicated headless Chromium. `attach`: drive your own Brave/Chrome over DevTools, start it if it is not running, never close it |
 | `MUSE2API_CDP_HOST` · `MUSE2API_CDP_PORT` | `127.0.0.1` · `19210` | DevTools endpoint (attach mode can point at a tunnel) |
 | `MUSE2API_BROWSER_LAUNCH_CMD` | empty | Attach mode: shell command that starts the browser when the port does not answer |
-| `MUSE2API_TAB_MODE` | `window` | `hidden`: windowless tabs that never appear or steal focus and are not throttled; `background`: background tabs; `window`: a window per tab |
+| `MUSE2API_TAB_MODE` | `window` | `minimized`: a background window per tab, created minimized, never appears or steals focus and keeps rendering (use with attach); `background`: background tabs in an existing window; `window`: a window per tab; `hidden`: windowless, but never painted so muse.ai does not hydrate (experimental) |
 | `MUSE2API_SHARED_PROFILE` | `false` | Attach mode: use the browser profile's own muse.ai login (account `browser`) instead of imported cookies |
 | `MUSE2API_KEEPALIVE_ENABLED` | `true` | Periodically renew sessions and wake each account's VM in the background |
 | `MUSE2API_KEEPALIVE_INTERVAL` | `600` | Seconds between keepalive rounds |
@@ -351,12 +351,12 @@ Run requests in the Brave you already use, logged in to muse.ai, without a headl
 MUSE2API_DRIVER=browser
 MUSE2API_BROWSER_MODE=attach
 MUSE2API_CDP_PORT=9222
-MUSE2API_TAB_MODE=hidden
+MUSE2API_TAB_MODE=minimized
 MUSE2API_SHARED_PROFILE=true
 ```
 
 * If nothing answers on the DevTools port, muse2api starts Brave with `--remote-debugging-port` (or runs `MUSE2API_BROWSER_LAUNCH_CMD`). A Brave already running *without* the flag must be quit once.
-* `hidden` tabs have no window and no tab-strip entry, never take focus, and still render as visible pages, so muse.ai is not throttled.
+* `minimized` tabs live in their own background window that is born minimized: nothing pops up, focus stays where you are, and the page keeps rendering, so muse.ai is not throttled. (`hidden` windowless targets are never painted and muse.ai never finishes hydrating in them.)
 * With `SHARED_PROFILE` the profile's muse.ai login is mirrored into the account `browser` at startup; keepalive writes rotated cookies back into the profile. Log in to muse.ai in Brave once.
 * muse2api never closes the attached browser; if you close it, the next request starts it again.
 

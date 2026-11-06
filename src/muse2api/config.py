@@ -13,7 +13,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 DriverName = Literal["mock", "browser", "http"]
 PoolStrategyName = Literal["round_robin", "lru", "affinity"]
 BrowserMode = Literal["launch", "attach"]
-TabMode = Literal["window", "hidden", "background"]
+TabMode = Literal["window", "minimized", "background", "hidden"]
 
 
 class Settings(BaseSettings):
@@ -76,9 +76,11 @@ class Settings(BaseSettings):
     tab_mode: TabMode = Field(
         default="window",
         description="How request tabs are opened. window: a new window per tab (old "
-        "behaviour, fine headless). hidden: a windowless target that never shows up or "
-        "takes focus, yet renders as visible (no background throttling). background: a "
-        "background tab in an existing window (gets throttled).",
+        "behaviour, fine headless). minimized: a new background window per tab, created "
+        "minimized - never shows up or takes focus, still renders and is not throttled "
+        "(recommended for attach). background: a background tab in an existing window. "
+        "hidden: windowless target - invisible, but Chromium never paints it, so muse.ai "
+        "does not finish hydrating; kept for experiments only.",
     )
     shared_profile: bool = Field(
         default=False,
