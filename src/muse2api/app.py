@@ -58,6 +58,8 @@ def create_app(settings: Settings | None = None, driver: MuseDriver | None = Non
         await services.requests.prune(settings.request_log_retention_days)
         await services.requests.backfill_tasks(services.tasks.list(limit=services.tasks.max_kept))
         await services.driver.startup()
+        if sync := getattr(services.driver, "sync_profile_account", None):
+            await sync(services.pool)
         for acc in services.pool.all():
             if acc.enabled and acc.status != AccountStatus.INVALID:
                 services.driver.prewarm(acc)

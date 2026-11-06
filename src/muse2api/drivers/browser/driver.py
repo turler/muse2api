@@ -1,4 +1,4 @@
-"""Browser driver: operates the muse.ai web client in headless Chromium over CDP.
+"""Browser driver: operates the muse.ai web client in Chromium/Brave over CDP.
 
 Design notes
 ------------
@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
 
-from ...accounts.model import Account
+from ...accounts.model import Account, AccountStatus
 from ...config import Settings
 from ...core.prompt import followup_text
 from ...errors import (
@@ -133,14 +133,38 @@ class BrowserDriver(MuseDriver):
 
     # ------------------------------------------------------------ lifecycle
     async def startup(self) -> None:
-        exe = find_chromium(self.settings.chromium_path)
+        s = self.settings
+        attach = s.browser_mode == "attach"
+        exe = s.chromium_path
+        if not (attach and s.browser_launch_cmd):
+            exe = find_chromium(s.chromium_path, prefer_brave=attach)
         self._chromium = ChromiumProcess(
-            exe, self.settings.cdp_port, self.settings.profile_dir, self.settings.headless,
-            proxy=self.settings.browser_proxy,
+            exe, s.cdp_port, s.profile_dir, s.headless, proxy=s.browser_proxy,
+            attach=attach, host=s.cdp_host, launch_cmd=s.browser_launch_cmd,
+            launch_wait=s.browser_launch_wait,
         )
         ws_url = await self._chromium.start()
         self._browser = await CDPSession.connect(ws_url)
-        log.info("browser driver ready")
+        log.info("browser driver ready (mode=%s, tabs=%s)", s.browser_mode, s.tab_mode)
+
+    async def _ensure_browser(self) -> None:
+        """Reconnect (and in attach mode restart the browser) after the user closed it."""
+        if self._browser is not None and not self._browser.closed:
+            return
+        async with self._ctx_lock:
+            if self._browser is not None and not self._browser.closed:
+                return
+            assert self._chromium
+            log.warning("browser connection lost; reconnecting")
+            # Every context and tab died with the old connection.
+            self._contexts.clear()
+            async with self._tab_cond:
+                for tabs in self._tabs.values():
+                    for t in tabs:
+                        t.stale = True
+                self._tab_cond.notify_all()
+            ws_url = await self._chromium.start()
+            self._browser = await CDPSession.connect(ws_url)
 
     async def shutdown(self) -> None:
         for task in self._warming.values():
@@ -219,6 +243,10 @@ class BrowserDriver(MuseDriver):
             self._tab_cond.notify_all()
 
     async def _context(self, account: Account) -> str:
+        """The account's browser context; "" means the browser's default context (the
+        profile's own cookies), used with ``MUSE2API_SHARED_PROFILE``."""
+        if self.settings.shared_profile:
+            return ""
         async with self._ctx_lock:
             if ctx := self._contexts.get(account.id):
                 return ctx
@@ -227,26 +255,51 @@ class BrowserDriver(MuseDriver):
             self._contexts[account.id] = res["browserContextId"]
             return res["browserContextId"]
 
+    def _target_params(self, context_id: str) -> dict[str, Any]:
+        params: dict[str, Any] = {"url": "about:blank"}
+        if context_id:
+            params["browserContextId"] = context_id
+        mode = self.settings.tab_mode
+        if mode == "hidden":
+            # No window, no tab strip entry, never takes focus; still renders as a
+            # visible page, so timers and rAF are not throttled.
+            params["hidden"] = True
+        elif mode == "background":
+            params["background"] = True
+        else:
+            # A window per tab: Chromium throttles background tabs of a shared window,
+            # which made parallel requests on one account run one after another.
+            params["newWindow"] = True
+            if self.settings.browser_mode == "attach":
+                params["background"] = True
+        return params
+
     async def _open_tab(self, account: Account) -> _Tab:
-        if missing := muse.missing_session_cookies(account.cookies):
+        shared = self.settings.shared_profile
+        if not shared and (missing := muse.missing_session_cookies(account.cookies)):
             raise UpstreamAuthError(f"account is missing session cookies: {', '.join(missing)}")
+        await self._ensure_browser()
         assert self._browser and self._chromium
         context_id = await self._context(account)
-        # A window per tab: Chromium throttles background tabs of a shared window,
-        # which made parallel requests on one account run one after another.
-        target = await self._browser.send(
-            "Target.createTarget",
-            {"url": "about:blank", "browserContextId": context_id, "newWindow": True},
-        )
+        params = self._target_params(context_id)
+        try:
+            target = await self._browser.send("Target.createTarget", params)
+        except CDPError:
+            if not params.pop("hidden", None):
+                raise
+            # Browsers without hidden-target support: fall back to a background tab.
+            log.warning("hidden targets unsupported; using background tabs")
+            self.settings.tab_mode = "background"
+            target = await self._browser.send("Target.createTarget",
+                                              self._target_params(context_id))
         target_id = target["targetId"]
-        session = await CDPSession.connect(
-            f"ws://127.0.0.1:{self._chromium.port}/devtools/page/{target_id}"
-        )
+        session = await CDPSession.connect(self._chromium.page_ws_url(target_id))
         for domain in ("Page", "Runtime", "Network"):
             await session.send(f"{domain}.enable")
         await session.send("Emulation.setFocusEmulationEnabled", {"enabled": True})
         await session.send("Page.setWebLifecycleState", {"state": "active"})
-        await self._set_cookies(session, account)
+        if not shared:
+            await self._set_cookies(session, account)
         return _Tab(account.id, context_id, target_id, session)
 
     async def _close_tab(self, tab: _Tab) -> None:
@@ -276,8 +329,9 @@ class BrowserDriver(MuseDriver):
                     )
 
     @staticmethod
-    async def _set_cookies(session: CDPSession, account: Account) -> None:
+    def _cookie_params(account: Account) -> list[dict[str, Any]]:
         floor = time.time() + 3600
+        out = []
         for name, value in account.cookies.items():
             if not value:
                 continue
@@ -295,6 +349,12 @@ class BrowserDriver(MuseDriver):
                 # Chromium rejects __Host- cookies that carry a Domain attribute.
                 params.pop("domain")
                 params["url"] = "https://muse.ai/"
+            out.append(params)
+        return out
+
+    @classmethod
+    async def _set_cookies(cls, session: CDPSession, account: Account) -> None:
+        for params in cls._cookie_params(account):
             await session.send("Network.setCookie", params)
 
     @staticmethod
@@ -863,7 +923,66 @@ class BrowserDriver(MuseDriver):
                                     req.on_progress, req.cancel)
 
     # ------------------------------------------------------------ session
+    PROFILE_ACCOUNT_ID = "browser"
+
+    async def sync_profile_account(self, pool: Any) -> Account | None:
+        """Shared-profile mode: mirror the browser profile's muse.ai login into the
+        account ``browser`` so the pool, keepalive and dashboard work unchanged."""
+        if not self.settings.shared_profile:
+            return None
+        cookies, expires = await self.profile_cookies()
+        acc = pool.get(self.PROFILE_ACCOUNT_ID) or Account(
+            id=self.PROFILE_ACCOUNT_ID, label="Browser profile")
+        acc.cookies, acc.cookie_expires = cookies, expires
+        if muse.missing_session_cookies(cookies):
+            log.warning("the browser profile is not logged in to muse.ai; log in there")
+            acc.last_error = "browser profile is not logged in to muse.ai"
+        elif acc.status == AccountStatus.INVALID:
+            acc.status = AccountStatus.ACTIVE
+            acc.last_error = None
+        await pool.upsert(acc)
+        return acc
+
+    async def profile_cookies(self) -> tuple[dict[str, str], dict[str, int]]:
+        """muse.ai cookies of the browser profile's default context (shared-profile mode)."""
+        await self._ensure_browser()
+        assert self._browser
+        res = await self._browser.send("Storage.getCookies", {})
+        cookies: dict[str, str] = {}
+        expires: dict[str, int] = {}
+        for c in res.get("cookies", []):
+            if not c.get("domain", "").lstrip(".").endswith("muse.ai") or not c.get("value"):
+                continue
+            cookies[c["name"]] = c["value"]
+            if (exp := c.get("expires") or 0) > 0:
+                expires[c["name"]] = int(exp)
+        return cookies, expires
+
     async def renew_session(self, account: Account) -> SessionInfo:
+        if self.settings.shared_profile:
+            return await self._renew_shared(account)
+        return await self._renew_isolated(account)
+
+    async def _renew_shared(self, account: Account) -> SessionInfo:
+        """The profile's cookie jar is the source of truth: renew with what the browser
+        holds now and write rotated cookies straight back into it."""
+        cookies, expires = await self.profile_cookies()
+        if muse.missing_session_cookies(cookies):
+            raise UpstreamAuthError("the browser profile is not logged in to muse.ai")
+        info = await muse.renew_session(cookies)
+        changed = {k: v for k, v in info.cookies.items() if cookies.get(k) != v}
+        if changed and self._browser:
+            fresh = account.model_copy(update={
+                "cookies": changed,
+                "cookie_expires": {**expires, **info.cookie_expires},
+            })
+            with contextlib.suppress(CDPError, TimeoutError):
+                await self._browser.send("Storage.setCookies", {
+                    "cookies": self._cookie_params(fresh)})
+        info.cookie_expires = {**expires, **info.cookie_expires}
+        return info
+
+    async def _renew_isolated(self, account: Account) -> SessionInfo:
         info = await muse.renew_session(account.cookies)
         # Cookies live in the account's browser context, so writing the rotated ones
         # through any open tab updates every tab and keeps hot and warm pages alive.

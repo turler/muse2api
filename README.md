@@ -332,11 +332,33 @@ All settings come from environment variables (prefix `MUSE2API_`) or a `.env` fi
 | `MUSE2API_ACCOUNT_MAX_CONCURRENCY` | `4` | Parallel requests per account (browser driver: one tab each, about 300 MB of memory per tab) |
 | `MUSE2API_WARM_THREADS` | `2` | Pre-started threads kept per account. A new muse.ai thread takes 20-40s to answer its first message, a started one about 5s, so chats that need a new thread go into a warm one. Each costs one extra short message of quota; needs a concurrency of at least 2 |
 | `MUSE2API_CHROMIUM_PATH` | auto-detected | Path to the browser executable |
+| `MUSE2API_BROWSER_MODE` | `launch` | `launch`: dedicated headless Chromium. `attach`: drive your own Brave/Chrome over DevTools, start it if it is not running, never close it |
+| `MUSE2API_CDP_HOST` · `MUSE2API_CDP_PORT` | `127.0.0.1` · `19210` | DevTools endpoint (attach mode can point at a tunnel) |
+| `MUSE2API_BROWSER_LAUNCH_CMD` | empty | Attach mode: shell command that starts the browser when the port does not answer |
+| `MUSE2API_TAB_MODE` | `window` | `hidden`: windowless tabs that never appear or steal focus and are not throttled; `background`: background tabs; `window`: a window per tab |
+| `MUSE2API_SHARED_PROFILE` | `false` | Attach mode: use the browser profile's own muse.ai login (account `browser`) instead of imported cookies |
 | `MUSE2API_KEEPALIVE_ENABLED` | `true` | Periodically renew sessions and wake each account's VM in the background |
 | `MUSE2API_KEEPALIVE_INTERVAL` | `600` | Seconds between keepalive rounds |
 | `MUSE2API_WAKE_CONFIRM_S` | `20` | Seconds to wait for a woken VM to report `RUNNING` |
 | `MUSE2API_QUOTA_CACHE_S` | `1800` | How long a quota reading is reused before muse.ai is asked again |
 | `MUSE2API_MATTING_MODEL` | `birefnet-general` | Model for `background: "transparent"` (`birefnet-general-lite` is faster) |
+
+## Using your own Brave (attach mode)
+
+Run requests in the Brave you already use, logged in to muse.ai, without a headless browser and without tabs popping up:
+
+```env
+MUSE2API_DRIVER=browser
+MUSE2API_BROWSER_MODE=attach
+MUSE2API_CDP_PORT=9222
+MUSE2API_TAB_MODE=hidden
+MUSE2API_SHARED_PROFILE=true
+```
+
+* If nothing answers on the DevTools port, muse2api starts Brave with `--remote-debugging-port` (or runs `MUSE2API_BROWSER_LAUNCH_CMD`). A Brave already running *without* the flag must be quit once.
+* `hidden` tabs have no window and no tab-strip entry, never take focus, and still render as visible pages, so muse.ai is not throttled.
+* With `SHARED_PROFILE` the profile's muse.ai login is mirrored into the account `browser` at startup; keepalive writes rotated cookies back into the profile. Log in to muse.ai in Brave once.
+* muse2api never closes the attached browser; if you close it, the next request starts it again.
 
 ## Roadmap
 

@@ -12,6 +12,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DriverName = Literal["mock", "browser", "http"]
 PoolStrategyName = Literal["round_robin", "lru", "affinity"]
+BrowserMode = Literal["launch", "attach"]
+TabMode = Literal["window", "hidden", "background"]
 
 
 class Settings(BaseSettings):
@@ -51,9 +53,39 @@ class Settings(BaseSettings):
     site_url: str = "https://muse.ai"
 
     # browser driver
+    browser_mode: BrowserMode = Field(
+        default="launch",
+        description="launch: run a dedicated (headless) Chromium owned by muse2api. "
+        "attach: drive the user's own browser (e.g. Brave) over its DevTools port, "
+        "starting it when it is not running and never closing it.",
+    )
     chromium_path: str = ""
+    cdp_host: str = Field(
+        default="127.0.0.1",
+        description="Host of the DevTools endpoint (attach mode can point at a tunnel).",
+    )
     cdp_port: int = 19210
     headless: bool = True
+    browser_launch_cmd: str = Field(
+        default="",
+        description="attach mode: shell command that starts the browser when the DevTools "
+        "port does not answer. Empty = run MUSE2API_CHROMIUM_PATH with "
+        "--remote-debugging-port.",
+    )
+    browser_launch_wait: float = 45.0
+    tab_mode: TabMode = Field(
+        default="window",
+        description="How request tabs are opened. window: a new window per tab (old "
+        "behaviour, fine headless). hidden: a windowless target that never shows up or "
+        "takes focus, yet renders as visible (no background throttling). background: a "
+        "background tab in an existing window (gets throttled).",
+    )
+    shared_profile: bool = Field(
+        default=False,
+        description="attach mode: use the browser profile's own muse.ai login (default "
+        "browser context) instead of one isolated context per account with imported "
+        "cookies. An account named 'browser' is created/synced from the profile cookies.",
+    )
     browser_proxy: str = Field(
         default="",
         description="Proxy for the browser only, e.g. socks5://127.0.0.1:10808 or http://10.144.1.10:8080. "
@@ -133,7 +165,11 @@ class Settings(BaseSettings):
         return self.data_dir / "requests.db"
 
     @property
-    def profile_dir(self) -> Path:
+    def profile_dir(self) -> Path | None:
+        """Launch mode always has a profile dir; attach mode uses the browser's normal
+        profile unless one is configured."""
+        if self.browser_mode == "attach":
+            return self.browser_profile_dir
         return self.browser_profile_dir or (self.data_dir / "browser-profile")
 
     def ensure_dirs(self) -> None:
